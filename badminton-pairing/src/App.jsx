@@ -1052,7 +1052,10 @@ const STORAGE_KEY = 'bp-session';
 function loadSavedState() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    return raw ? JSON.parse(raw) : null;
+    if (!raw) return null;
+    const saved = JSON.parse(raw);
+    // Migrate state saved before exclusions/preferred were added
+    return { exclusions: [], preferred: [], ...saved };
   } catch {
     return null;
   }
