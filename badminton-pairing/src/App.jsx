@@ -17,6 +17,8 @@ const W = {
   fatigue: 12, // per extra consecutive game beyond 3
   stacking: 6, // per team where both players are skill ≥ 4 or both ≤ 2
   opponentRepeat: 2, // per previous occurrence of this opponent matchup (mild)
+  preferredAlternate: -40, // bonus when preferred pair (every-other-game mode) are on the same team
+  preferredOccasional: -30, // bonus when preferred pair (occasionally mode) — T=1 scores -5 (still preferred), T=2 scores +20 (natural fade)
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -78,7 +80,8 @@ function buildMatrix(players, history) {
 // ─────────────────────────────────────────────────────────────────────────────
 // CANDIDATE BUILDER  — NC4 × 3 one-court candidates from active players
 // ─────────────────────────────────────────────────────────────────────────────
-function buildCandidates(players, matrix) {
+function buildCandidates(players, matrix, exclusions = []) {
+  const exclSet = new Set(exclusions.map(({ a, b }) => pk(a, b)));
   const res = [];
   C(
     players.map((p) => p.id),
@@ -120,6 +123,7 @@ function buildCandidates(players, matrix) {
         (p3.skill <= 2 && p4.skill <= 2 ? 1 : 0);
       const pqScore =
         (matrix[t1pk]?.staticPenalty ?? 0) + (matrix[t2pk]?.staticPenalty ?? 0);
+      if (exclSet.has(t1pk) || exclSet.has(t2pk)) return;
       res.push({
         cid: uid(),
         team1: t1,
@@ -146,26 +150,45 @@ function buildCandidates(players, matrix) {
 // Single number — lower is better. Weights ensure partner rotation dominates
 // small skill gaps. A fresh Δ3 pairing always beats any repeated pairing.
 // ─────────────────────────────────────────────────────────────────────────────
-function scoreRound(rc, players, matrix, rn) {
+function scoreRound(rc, players, matrix, rn, preferred = []) {
   const { courts, sittingIds } = rc;
   const playIds = courts.flatMap((c) => c.allIds);
   const gp = (id) => players.find((p) => p.id === id);
+  // prefMap stores { weight, alternate } per pair key.
+  // alternate=true pairs suppress the cumulative partnerRepeat penalty so timesPartnered
+  // never accumulates against them — only the recentPartner block (last round) still applies.
+  // This gives true every-other-game behaviour regardless of how many times they've played together.
+  // occasional pairs keep the full cumulative penalty so their preference fades naturally after a few sessions.
+  const prefMap = new Map(preferred.map(({ a, b, freq }) => [
+    pk(a, b),
+    { weight: freq === 'occasional' ? W.preferredOccasional : W.preferredAlternate, alternate: freq !== 'occasional' },
+  ]));
   let s = 0;
 
   // Per-court penalties
   let maxDiff = 0,
     totalRepeats = 0,
-    hasRecentRepeat = false;
+    hasRecentRepeat = false,
+    preferredHit = false;
   courts.forEach((c) => {
     // Skill balance
     s += c.skDiff * W.skillImbalance;
     maxDiff = Math.max(maxDiff, c.skDiff);
 
-    // Partner history
+    // Preferred pair bonus (per-pair weight based on chosen frequency)
+    const t1pref = prefMap.get(c.t1pk);
+    const t2pref = prefMap.get(c.t2pk);
+    if (t1pref !== undefined) { s += t1pref.weight; preferredHit = true; }
+    if (t2pref !== undefined) { s += t2pref.weight; preferredHit = true; }
+
+    // Partner history.
+    // For alternate-mode preferred pairs, suppress the cumulative timesPartnered penalty
+    // so the bonus stays effective every other round regardless of session length.
+    // The recentPartner penalty is always applied to block back-to-back rounds.
     const t1p = matrix[c.t1pk],
       t2p = matrix[c.t2pk];
     if (t1p) {
-      s += t1p.timesPartnered * W.partnerRepeat;
+      if (!t1pref?.alternate) s += t1p.timesPartnered * W.partnerRepeat;
       if (t1p.lastPartneredRound === rn - 1) {
         s += W.recentPartner;
         hasRecentRepeat = true;
@@ -173,7 +196,7 @@ function scoreRound(rc, players, matrix, rn) {
       totalRepeats += t1p.timesPartnered;
     }
     if (t2p) {
-      s += t2p.timesPartnered * W.partnerRepeat;
+      if (!t2pref?.alternate) s += t2p.timesPartnered * W.partnerRepeat;
       if (t2p.lastPartneredRound === rn - 1) {
         s += W.recentPartner;
         hasRecentRepeat = true;
@@ -212,7 +235,7 @@ function scoreRound(rc, players, matrix, rn) {
   s += Math.random();
 
   // Store analysis for UI explanations
-  rc.analysis = { maxDiff, totalRepeats, hasRecentRepeat };
+  rc.analysis = { maxDiff, totalRepeats, hasRecentRepeat, preferredHit };
   return s;
 }
 
@@ -224,6 +247,7 @@ function mkExpl(rc) {
     maxDiff = 0,
     totalRepeats = 0,
     hasRecentRepeat = false,
+    preferredHit = false,
   } = rc.analysis || {};
   const out = [];
 
@@ -241,6 +265,9 @@ function mkExpl(rc) {
 
   if (rc.sittingIds.length === 0)
     out.push({ text: 'Everyone plays', ok: true });
+
+  if (preferredHit) out.push({ text: 'Preferred pair matched', ok: true });
+
   return out;
 }
 
@@ -331,12 +358,12 @@ function findDisjointCombos(pool, n, maxResults = 500) {
 // findDisjointCombos keeps runtime well under 100ms.
 // ─────────────────────────────────────────────────────────────────────────────
 function genRound(state) {
-  const { players, settings, matchHistory, roundNumber } = state;
+  const { players, settings, matchHistory, roundNumber, exclusions = [], preferred = [] } = state;
   const active = players.filter((p) => p.status === 'active');
   if (active.length < 4) return { error: 'Need at least 4 active players.' };
 
   const matrix = buildMatrix(active, matchHistory);
-  const allCands = buildCandidates(active, matrix);
+  const allCands = buildCandidates(active, matrix, exclusions);
   const maxCourts = Math.floor(active.length / 4);
   const courtsToGen = Math.min(settings.courts, maxCourts);
   const note =
@@ -347,11 +374,15 @@ function genRound(state) {
   const activeIds = active.map((p) => p.id);
   let rcs = [];
 
+  if (allCands.length === 0) {
+    return { error: 'Exclusion rules leave no valid pairings — remove some.' };
+  }
+
   if (courtsToGen === 1) {
     allCands.forEach((c) => {
       const sittingIds = activeIds.filter((id) => !c.allIds.includes(id));
       const rc = { id: uid(), courts: [c], sittingIds };
-      rc.score = scoreRound(rc, active, matrix, roundNumber);
+      rc.score = scoreRound(rc, active, matrix, roundNumber, preferred);
       rc.explanations = mkExpl(rc);
       rcs.push(rc);
     });
@@ -367,7 +398,7 @@ function genRound(state) {
       const playIds = courts.flatMap((c) => c.allIds);
       const sittingIds = activeIds.filter((id) => !playIds.includes(id));
       const rc = { id: uid(), courts, sittingIds };
-      rc.score = scoreRound(rc, active, matrix, roundNumber);
+      rc.score = scoreRound(rc, active, matrix, roundNumber, preferred);
       rc.explanations = mkExpl(rc);
       rcs.push(rc);
     });
@@ -377,7 +408,7 @@ function genRound(state) {
       allCands.forEach((c) => {
         const sittingIds = activeIds.filter((id) => !c.allIds.includes(id));
         const rc = { id: uid(), courts: [c], sittingIds };
-        rc.score = scoreRound(rc, active, matrix, roundNumber);
+        rc.score = scoreRound(rc, active, matrix, roundNumber, preferred);
         rc.explanations = mkExpl(rc);
         rcs.push(rc);
       });
@@ -412,6 +443,8 @@ const INIT = {
   view: 'setup',
   players: [],
   settings: { courts: 2, scoreTarget: 21 },
+  exclusions: [],
+  preferred: [],
   matchHistory: [],
   roundNumber: 1,
   ranked: [],
@@ -440,6 +473,22 @@ function reducer(state, action) {
       }
       return { ...state, players: updPlayers };
     }
+    case 'ADD_EXCL': {
+      const key = pk(action.pair.a, action.pair.b);
+      if (state.exclusions.some(({ a, b }) => pk(a, b) === key)) return state;
+      return { ...state, exclusions: [...state.exclusions, action.pair] };
+    }
+    case 'DEL_EXCL':
+      return { ...state, exclusions: state.exclusions.filter(({ a, b }) => pk(a, b) !== action.key) };
+    case 'ADD_PREF': {
+      const key = pk(action.pair.a, action.pair.b);
+      if (state.preferred.some(({ a, b }) => pk(a, b) === key)) return state;
+      return { ...state, preferred: [...state.preferred, action.pair] };
+    }
+    case 'DEL_PREF':
+      return { ...state, preferred: state.preferred.filter(({ a, b }) => pk(a, b) !== action.key) };
+    case 'UPD_PREF':
+      return { ...state, preferred: state.preferred.map(p => pk(p.a, p.b) === action.key ? { ...p, freq: action.freq } : p) };
     case 'SET_S':
       return {
         ...state,
@@ -551,7 +600,8 @@ function reducer(state, action) {
     case 'RESET_KEEP_PLAYERS': {
       localStorage.removeItem('bp-session');
       const freshPlayers = state.players.map((p) => mkPlayer(p.name, p.skill));
-      return { ...INIT, players: freshPlayers, settings: { ...state.settings } };
+      return { ...INIT, players: freshPlayers, settings: { ...state.settings },
+               exclusions: state.exclusions, preferred: state.preferred };
     }
     case 'RESET':
       localStorage.removeItem('bp-session');
@@ -993,6 +1043,11 @@ export default function App() {
   const [newSkill, setNewSkill] = useState(3);
   const [genErr, setGenErr] = useState('');
   const [showResetMenu, setShowResetMenu] = useState(false);
+  const [showAddExcl, setShowAddExcl] = useState(false);
+  const [showAddPref, setShowAddPref] = useState(false);
+  const [pairFormA, setPairFormA] = useState('');
+  const [pairFormB, setPairFormB] = useState('');
+  const [pairFormFreq, setPairFormFreq] = useState('alternate');
 
   const pName = (id) => state.players.find((p) => p.id === id)?.name ?? '?';
 
@@ -1069,7 +1124,9 @@ export default function App() {
   ) : null;
 
   // ── SETUP ─────────────────────────────────────────────────────────────────
-  if (state.view === 'setup')
+  if (state.view === 'setup') {
+    const activeCt = state.players.filter(p => p.status === 'active').length;
+    const restingCt = state.players.length - activeCt;
     return (
       <>
       <div className="bp-app">
@@ -1204,17 +1261,22 @@ export default function App() {
                 <span style={{ ...LBL, marginBottom: 0 }}>
                   {state.players.length} player
                   {state.players.length !== 1 ? 's' : ''}
+                  {restingCt > 0 && (
+                    <span style={{ fontWeight: 400, textTransform: 'none', letterSpacing: 0, fontSize: 11, color: AMB }}>
+                      {' '}({restingCt} resting)
+                    </span>
+                  )}
                 </span>
                 <span
                   style={{
                     fontSize: 12,
                     fontWeight: 600,
-                    color: state.players.length >= 4 ? GRN : AMB,
+                    color: activeCt >= 4 ? GRN : AMB,
                   }}
                 >
-                  {state.players.length >= 4
+                  {activeCt >= 4
                     ? '✓ Ready'
-                    : `${4 - state.players.length} more needed`}
+                    : `${4 - activeCt} more needed`}
                 </span>
               </div>
               {state.players.map((p, i) => (
@@ -1231,6 +1293,7 @@ export default function App() {
                         fontWeight: 600,
                         fontSize: 15,
                         color: 'var(--color-text-primary)',
+                        opacity: p.status === 'resting' ? 0.45 : 1,
                         minWidth: 0,
                         overflow: 'hidden',
                         textOverflow: 'ellipsis',
@@ -1263,6 +1326,23 @@ export default function App() {
                           </button>
                         ))}
                       </div>
+                      <button
+                        className="bp-btn"
+                        onClick={() => dispatch({ type: 'UPD_P', id: p.id, u: { status: p.status === 'resting' ? 'active' : 'resting' } })}
+                        style={{
+                          padding: '4px 8px',
+                          borderRadius: 7,
+                          border: p.status === 'resting' ? `1.5px solid ${AMB}` : '1px solid var(--color-border-secondary)',
+                          background: p.status === 'resting' ? `rgba(245,158,11,0.15)` : 'var(--color-background-secondary)',
+                          color: p.status === 'resting' ? AMB : 'var(--color-text-secondary)',
+                          fontWeight: 600,
+                          fontSize: 11,
+                          cursor: 'pointer',
+                          whiteSpace: 'nowrap',
+                        }}
+                      >
+                        {p.status === 'resting' ? 'Resting' : 'Rest'}
+                      </button>
                       <BtnDanger
                         onClick={() => dispatch({ type: 'DEL_P', id: p.id })}
                         style={{ padding: '5px 9px', fontSize: 12 }}
@@ -1282,11 +1362,114 @@ export default function App() {
             </div>
           )}
 
+          {state.players.length >= 2 && (() => {
+            const resetPairForm = () => { setPairFormA(''); setPairFormB(''); setPairFormFreq('alternate'); };
+            const addPair = (type) => {
+              if (!pairFormA || !pairFormB || pairFormA === pairFormB) return;
+              const pair = type === 'ADD_PREF'
+                ? { a: pairFormA, b: pairFormB, freq: pairFormFreq }
+                : { a: pairFormA, b: pairFormB };
+              dispatch({ type, pair });
+              resetPairForm();
+              setShowAddExcl(false);
+              setShowAddPref(false);
+            };
+            const selectStyle = { ...INP, flex: 1, minWidth: 100, padding: '8px 10px', fontSize: 13 };
+            const PairForm = ({ onAdd, onCancel, showFreq }) => (
+              <div style={{ marginTop: 10 }}>
+                <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+                  <select value={pairFormA} onChange={e => { setPairFormA(e.target.value); setPairFormB(''); }} style={selectStyle}>
+                    <option value="">Player A</option>
+                    {state.players.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+                  </select>
+                  <select value={pairFormB} onChange={e => setPairFormB(e.target.value)} style={selectStyle}>
+                    <option value="">Player B</option>
+                    {state.players.filter(p => p.id !== pairFormA).map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+                  </select>
+                </div>
+                {showFreq && (
+                  <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
+                    {[['alternate', 'Every other game'], ['occasional', 'Occasionally']].map(([val, label]) => (
+                      <button key={val} className="bp-btn" onClick={() => setPairFormFreq(val)}
+                        style={{ flex: 1, padding: '7px 0', borderRadius: 8, border: 'none', cursor: 'pointer', fontSize: 12, fontWeight: 600,
+                          background: pairFormFreq === val ? GRN : 'var(--color-background-secondary)',
+                          color: pairFormFreq === val ? '#fff' : 'var(--color-text-secondary)',
+                          boxShadow: pairFormFreq === val ? `0 0 0 2px ${GRN}` : '0 0 0 1px var(--color-border-tertiary)' }}>
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
+                  <BtnPrimary onClick={onAdd} style={{ padding: '8px 16px', fontSize: 13 }}>Add</BtnPrimary>
+                  <BtnSec onClick={onCancel}>Cancel</BtnSec>
+                </div>
+              </div>
+            );
+            return (
+              <div style={CARD}>
+                <span style={LBL}>Pairings (optional)</span>
+
+                <div style={{ marginBottom: 16 }}>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--color-text-secondary)', marginBottom: 8 }}>
+                    Never partner
+                  </div>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                    {state.exclusions.map(({ a, b }) => (
+                      <span key={pk(a, b)} style={{ display: 'inline-flex', alignItems: 'center', gap: 5, background: 'rgba(220,38,38,0.08)', border: `1px solid rgba(220,38,38,0.25)`, borderRadius: 20, padding: '5px 10px', fontSize: 12, color: RED }}>
+                        {pName(a)} × {pName(b)}
+                        <button onClick={() => dispatch({ type: 'DEL_EXCL', key: pk(a, b) })} style={{ background: 'none', border: 'none', cursor: 'pointer', color: RED, fontSize: 13, lineHeight: 1, padding: 0 }}>✕</button>
+                      </span>
+                    ))}
+                    {!showAddExcl && (
+                      <button className="bp-btn" onClick={() => { setShowAddExcl(true); setShowAddPref(false); resetPairForm(); }}
+                        style={{ padding: '5px 12px', borderRadius: 20, border: '1px dashed var(--color-border-secondary)', background: 'transparent', color: 'var(--color-text-secondary)', fontSize: 12, cursor: 'pointer' }}>
+                        + Add pair
+                      </button>
+                    )}
+                  </div>
+                  {showAddExcl && <PairForm showFreq={false} onAdd={() => addPair('ADD_EXCL')} onCancel={() => { setShowAddExcl(false); resetPairForm(); }} />}
+                </div>
+
+                <div>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--color-text-secondary)', marginBottom: 8 }}>
+                    Try to pair together
+                  </div>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                    {state.preferred.map(({ a, b, freq = 'alternate' }) => {
+                      const key = pk(a, b);
+                      const isOcc = freq === 'occasional';
+                      return (
+                        <span key={key} style={{ display: 'inline-flex', alignItems: 'center', gap: 5, background: 'rgba(5,150,105,0.08)', border: `1px solid rgba(5,150,105,0.25)`, borderRadius: 20, padding: '5px 10px', fontSize: 12, color: GRN }}>
+                          {pName(a)} + {pName(b)}
+                          <button
+                            onClick={() => dispatch({ type: 'UPD_PREF', key, freq: isOcc ? 'alternate' : 'occasional' })}
+                            title={isOcc ? 'Occasionally — tap to switch to every other game' : 'Every other game — tap to switch to occasionally'}
+                            style={{ background: 'rgba(5,150,105,0.15)', border: `1px solid rgba(5,150,105,0.3)`, borderRadius: 10, cursor: 'pointer', color: GRN, fontSize: 10, fontWeight: 700, padding: '1px 6px', lineHeight: '16px', whiteSpace: 'nowrap' }}>
+                            {isOcc ? 'occ.' : '~50%'}
+                          </button>
+                          <button onClick={() => dispatch({ type: 'DEL_PREF', key })} style={{ background: 'none', border: 'none', cursor: 'pointer', color: GRN, fontSize: 13, lineHeight: 1, padding: 0 }}>✕</button>
+                        </span>
+                      );
+                    })}
+                    {!showAddPref && (
+                      <button className="bp-btn" onClick={() => { setShowAddPref(true); setShowAddExcl(false); resetPairForm(); }}
+                        style={{ padding: '5px 12px', borderRadius: 20, border: '1px dashed var(--color-border-secondary)', background: 'transparent', color: 'var(--color-text-secondary)', fontSize: 12, cursor: 'pointer' }}>
+                        + Add pair
+                      </button>
+                    )}
+                  </div>
+                  {showAddPref && <PairForm showFreq={true} onAdd={() => addPair('ADD_PREF')} onCancel={() => { setShowAddPref(false); resetPairForm(); }} />}
+                </div>
+              </div>
+            );
+          })()}
+
           <div style={{ textAlign: 'center', fontSize: 12, color: 'var(--color-text-secondary)', marginBottom: 12, lineHeight: 1.5 }}>
             Auto-saved in this browser — data survives refreshes and new tabs.
             Only clears when you tap Reset Session or clear browser storage.
           </div>
-          {state.players.length >= 4 ? (
+          {activeCt >= 4 ? (
             <BtnPrimary onClick={() => dispatch({ type: 'START' })}>
               Start session →
             </BtnPrimary>
@@ -1300,7 +1483,11 @@ export default function App() {
                 padding: '22px 20px',
               }}
             >
-              Add at least 4 players to start
+              {state.players.length === 0
+                ? 'Add at least 4 players to start'
+                : activeCt === 0
+                  ? 'All players are resting — un-rest at least 4 to start'
+                  : `${4 - activeCt} more active player${4 - activeCt !== 1 ? 's' : ''} needed`}
             </div>
           )}
         </div>
@@ -1308,6 +1495,7 @@ export default function App() {
       {resetBottomSheet}
       </>
     );
+  }
 
   // ── SESSION ───────────────────────────────────────────────────────────────
   if (state.view === 'session')
@@ -1494,7 +1682,7 @@ export default function App() {
                 Option {state.regenIdx + 1} of {state.ranked.length}
               </div>
 
-              <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+              <div style={{ display: 'flex', gap: 8 }}>
                 <BtnSec
                   onClick={() => dispatch({ type: 'REGEN' })}
                   style={{ flex: 1 }}
@@ -1519,9 +1707,6 @@ export default function App() {
                   Enter scores →
                 </button>
               </div>
-              <BtnSec onClick={handleGenerate} style={{ width: '100%' }}>
-                ↺ Re-generate fresh
-              </BtnSec>
             </>
           )}
         </div>
