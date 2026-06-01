@@ -138,7 +138,7 @@ function buildCandidates(players, matrix, exclusions = []) {
         advStack,
         lowStack,
         pqScore,
-        staticRank: skDiff + advStack + lowStack, // used only for pre-filtering with large N
+        staticRank: skDiff + advStack + lowStack,
       });
     });
   });
@@ -387,23 +387,54 @@ function genRound(state) {
       rcs.push(rc);
     });
   } else {
-    // Full enumeration for all practical group sizes (≤15 = ≤3003 one-court candidates).
-    // The maxResults cap in findDisjointCombos keeps scoring fast.
-    const pool =
-      active.length <= 15
-        ? allCands
-        : [...allCands].sort((a, b) => a.staticRank - b.staticRank).slice(0, 300);
+    // Sort by staticRank so the backtracker sees balanced courts first.
+    // Cap at 300 only for very large groups (N > 15).
+    const sorted = [...allCands].sort((a, b) => a.staticRank - b.staticRank);
+    const pool = active.length <= 15 ? sorted : sorted.slice(0, 300);
 
-    findDisjointCombos(pool, courtsToGen).forEach((courts) => {
+    const pushRc = (courts) => {
       const playIds = courts.flatMap((c) => c.allIds);
       const sittingIds = activeIds.filter((id) => !playIds.includes(id));
       const rc = { id: uid(), courts, sittingIds };
       rc.score = scoreRound(rc, active, matrix, roundNumber, preferred);
       rc.explanations = mkExpl(rc);
       rcs.push(rc);
+    };
+
+    // Seeded pass: for each preferred pair, explicitly anchor their best one-court
+    // candidates and find disjoint completions from the full pool.
+    // This guarantees preferred-pair combos are scored at ANY group size,
+    // without flooding the pool (which would prevent non-preferred alternatives
+    // from appearing in rounds when the preferred pair is blocked by recentPartner).
+    if (preferred.length > 0) {
+      preferred.forEach(({ a: pa, b: pb }) => {
+        const pairKey = pk(pa, pb);
+        allCands
+          .filter((c) => c.t1pk === pairKey || c.t2pk === pairKey)
+          .sort((a, b) => a.staticRank - b.staticRank)
+          .slice(0, 15)
+          .forEach((pc) => {
+            const restPool = pool.filter((c) => !c.allIds.some((id) => pc.allIds.includes(id)));
+            findDisjointCombos(restPool, courtsToGen - 1, 10).forEach((restCourts) => {
+              pushRc([pc, ...restCourts]);
+            });
+          });
+      });
+    }
+
+    // Normal pass: full sorted pool for alternatives (including non-preferred rounds).
+    findDisjointCombos(pool, courtsToGen).forEach((courts) => pushRc(courts));
+
+    // Deduplicate by court composition (seeded + normal passes may overlap)
+    const seen = new Set();
+    rcs = rcs.filter((rc) => {
+      const key = rc.courts.map((c) => [c.t1pk, c.t2pk].sort().join(':')).sort().join('|');
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
     });
 
-    // Fallback: if no multi-court combos found (e.g. odd player count edge case), drop to 1 court
+    // Fallback: if no multi-court combos found, drop to 1 court
     if (rcs.length === 0) {
       allCands.forEach((c) => {
         const sittingIds = activeIds.filter((id) => !c.allIds.includes(id));
@@ -599,7 +630,7 @@ function reducer(state, action) {
       return { ...state, view: 'setup', currentRound: null, ranked: [], regenIdx: 0, note: null };
     case 'RESET_KEEP_PLAYERS': {
       localStorage.removeItem('bp-session');
-      const freshPlayers = state.players.map((p) => mkPlayer(p.name, p.skill));
+      const freshPlayers = state.players.map((p) => ({ ...mkPlayer(p.name, p.skill), id: p.id }));
       return { ...INIT, players: freshPlayers, settings: { ...state.settings },
                exclusions: state.exclusions, preferred: state.preferred };
     }

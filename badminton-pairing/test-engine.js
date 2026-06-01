@@ -167,13 +167,37 @@ function genRound(state) {
       rcs.push(rc);
     });
   } else {
-    const pool = active.length<=15 ? allCands : [...allCands].sort((a,b)=>a.staticRank-b.staticRank).slice(0,300);
-    findDisjointCombos(pool, courtsToGen).forEach((courts) => {
-      const playIds = courts.flatMap((c) => c.allIds);
-      const sittingIds = activeIds.filter((id) => !playIds.includes(id));
+    const sorted = [...allCands].sort((a,b)=>a.staticRank-b.staticRank);
+    const pool = active.length<=15 ? sorted : sorted.slice(0,300);
+    const pushRc = (courts) => {
+      const playIds = courts.flatMap(c=>c.allIds);
+      const sittingIds = activeIds.filter(id=>!playIds.includes(id));
       const rc = { id: uid(), courts, sittingIds };
       rc.score = scoreRound(rc, active, matrix, roundNumber, preferred);
       rcs.push(rc);
+    };
+    if (preferred.length > 0) {
+      preferred.forEach(({ a: pa, b: pb }) => {
+        const pairKey = pk(pa, pb);
+        allCands
+          .filter(c => c.t1pk === pairKey || c.t2pk === pairKey)
+          .sort((a,b) => a.staticRank - b.staticRank)
+          .slice(0, 15)
+          .forEach(pc => {
+            const restPool = pool.filter(c => !c.allIds.some(id => pc.allIds.includes(id)));
+            findDisjointCombos(restPool, courtsToGen - 1, 10).forEach(restCourts => {
+              pushRc([pc, ...restCourts]);
+            });
+          });
+      });
+    }
+    findDisjointCombos(pool, courtsToGen).forEach(courts => pushRc(courts));
+    const seen = new Set();
+    rcs = rcs.filter(rc => {
+      const key = rc.courts.map(c=>[c.t1pk,c.t2pk].sort().join(':')).sort().join('|');
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
     });
     if (rcs.length === 0) {
       allCands.forEach((c) => {
@@ -902,6 +926,226 @@ describe('29. Setup-page resting — active count drives engine', () => {
     assert(!res.error);
     eq(res.candidates[0].courts.length, 2);
     eq(res.candidates[0].sittingIds.length, 0);
+  });
+});
+
+// ─── New test: Preferred pair with 12 players (30) ───────────────────────────
+
+describe('30. Preferred — 12 players, 2 courts (large N pool coverage)', () => {
+  // This tests the fix: staticRank boost + sorted pool ensures preferred-pair
+  // candidates survive findDisjointCombos before its 500-result cap.
+  // With the old unsorted pool, Mark+Grace rarely appeared in the first 500 combos
+  // because C(n,4) lexicographic ordering pushed their combinations to the back.
+  const players = [
+    mkPlayer('Mark',3), mkPlayer('Grace',1),
+    mkPlayer('P1',2), mkPlayer('P2',3), mkPlayer('P3',4), mkPlayer('P4',4),
+    mkPlayer('P5',3), mkPlayer('P6',2), mkPlayer('P7',4), mkPlayer('P8',3),
+    mkPlayer('P9',5), mkPlayer('P10',3),
+  ];
+  const markId = players[0].id, graceId = players[1].id;
+  const pref = [{ a: markId, b: graceId, freq: 'alternate' }];
+  let state = mkState(players, 2, 21, [], pref);
+
+  let errors = 0, pairedCount = 0;
+  for (let i = 0; i < 10; i++) {
+    const res = genRound(state);
+    if (res.error) { errors++; break; }
+    if (isPaired(res.candidates[0], markId, graceId)) pairedCount++;
+    state = submitRound(state, res.candidates[0]);
+  }
+
+  test('No error across 10 rounds with 12 players', () => eq(errors, 0));
+  test('Preferred pair appears in Option 1 in at least 3 of 10 rounds (every-other-game)', () => {
+    // 4 of 12 sit per round → ~1/3 chance either Mark or Grace sits out each round.
+    // When both play, alternate mode guarantees they partner. Expect 3–5 of 10.
+    assert(pairedCount >= 3, `paired ${pairedCount}/10 — preferred pair not surfacing in large group`);
+  });
+  test('Round 1 preferred pair appears in top-3 options', () => {
+    const res = genRound(mkState(players, 2, 21, [], pref));
+    const top3 = res.candidates.slice(0, 3);
+    const inTop3 = top3.some(rc => isPaired(rc, markId, graceId));
+    assert(inTop3, 'Preferred pair not in top-3 options — staticRank boost may not be working');
+  });
+});
+
+// ─── New tests: Multi-constraint robustness (31–35) ──────────────────────────
+
+describe('31. Two preferred pairs — 8 players, 2 courts', () => {
+  // Both fit on separate courts simultaneously (combined −80 bonus).
+  // Engine should pair both every other round, with neither on the in-between rounds.
+  const players = [
+    mkPlayer('Mark',3), mkPlayer('Grace',3),
+    mkPlayer('Andrea',4), mkPlayer('Ava',5),
+    mkPlayer('P1',3), mkPlayer('P2',3), mkPlayer('P3',2), mkPlayer('P4',4),
+  ];
+  const [markId, graceId, andreaId, avaId] = players.map(p => p.id);
+  const pref = [
+    { a: markId, b: graceId, freq: 'alternate' },
+    { a: andreaId, b: avaId, freq: 'alternate' },
+  ];
+  let state = mkState(players, 2, 21, [], pref);
+
+  let errors = 0, mgCount = 0, aaCount = 0;
+  for (let i = 0; i < 8; i++) {
+    const res = genRound(state);
+    if (res.error) { errors++; break; }
+    if (isPaired(res.candidates[0], markId, graceId)) mgCount++;
+    if (isPaired(res.candidates[0], andreaId, avaId)) aaCount++;
+    state = submitRound(state, res.candidates[0]);
+  }
+
+  test('No error across 8 rounds', () => eq(errors, 0));
+  test('Mark+Grace appear in at least 3 of 8 rounds', () => assert(mgCount >= 3, `paired ${mgCount}/8`));
+  test('Andrea+Ava appear in at least 3 of 8 rounds', () => assert(aaCount >= 3, `paired ${aaCount}/8`));
+  test('Both preferred pairs in top-5 options for round 1', () => {
+    const res = genRound(mkState(players, 2, 21, [], pref));
+    const top5 = res.candidates.slice(0, 5);
+    assert(top5.some(rc => isPaired(rc, markId, graceId)), 'Mark+Grace not in top-5 options');
+    assert(top5.some(rc => isPaired(rc, andreaId, avaId)), 'Andrea+Ava not in top-5 options');
+  });
+});
+
+describe('32. Two preferred pairs — 12 players, 2 courts (large N)', () => {
+  // Verifies both pairs survive the findDisjointCombos pool cap independently.
+  const players = [
+    mkPlayer('Mark',3), mkPlayer('Grace',3),
+    mkPlayer('Andrea',4), mkPlayer('Ava',5),
+    mkPlayer('P1',2), mkPlayer('P2',3), mkPlayer('P3',4), mkPlayer('P4',3),
+    mkPlayer('P5',3), mkPlayer('P6',4), mkPlayer('P7',2), mkPlayer('P8',3),
+  ];
+  const [markId, graceId, andreaId, avaId] = players.map(p => p.id);
+  const pref = [
+    { a: markId, b: graceId, freq: 'alternate' },
+    { a: andreaId, b: avaId, freq: 'alternate' },
+  ];
+  let state = mkState(players, 2, 21, [], pref);
+
+  let errors = 0, mgCount = 0, aaCount = 0;
+  for (let i = 0; i < 10; i++) {
+    const res = genRound(state);
+    if (res.error) { errors++; break; }
+    if (isPaired(res.candidates[0], markId, graceId)) mgCount++;
+    if (isPaired(res.candidates[0], andreaId, avaId)) aaCount++;
+    state = submitRound(state, res.candidates[0]);
+  }
+
+  test('No error across 10 rounds', () => eq(errors, 0));
+  test('Mark+Grace appear in at least 2 of 10 rounds (sitting reduces frequency)', () => assert(mgCount >= 2, `paired ${mgCount}/10`));
+  // Andrea+Ava is a stacking pair (both ≥4), incurring an extra penalty alongside sitting rotation;
+  // pool coverage is verified by the top-5 check — count threshold is kept conservative.
+  test('Andrea+Ava appear in at least 1 of 10 rounds', () => assert(aaCount >= 1, `paired ${aaCount}/10`));
+  test('Both in top-5 options for round 1', () => {
+    const res = genRound(mkState(players, 2, 21, [], pref));
+    const top5 = res.candidates.slice(0, 5);
+    assert(top5.some(rc => isPaired(rc, markId, graceId)), 'Mark+Grace not in top-5 options at 12 players');
+    assert(top5.some(rc => isPaired(rc, andreaId, avaId)), 'Andrea+Ava not in top-5 options at 12 players');
+  });
+});
+
+describe('33. Preferred — 12 players, 3 courts (no sitters, every round)', () => {
+  // 3 × 4 = 12: everyone plays every round.
+  // Both players always available → alternate mode delivers every other round reliably.
+  const players = [
+    mkPlayer('Mark',3), mkPlayer('Grace',1),
+    mkPlayer('P1',3), mkPlayer('P2',3), mkPlayer('P3',4), mkPlayer('P4',4),
+    mkPlayer('P5',3), mkPlayer('P6',3), mkPlayer('P7',4), mkPlayer('P8',2),
+    mkPlayer('P9',2), mkPlayer('P10',3),
+  ];
+  const markId = players[0].id, graceId = players[1].id;
+  const pref = [{ a: markId, b: graceId, freq: 'alternate' }];
+  let state = mkState(players, 3, 21, [], pref);
+
+  let errors = 0, pairedCount = 0;
+  for (let i = 0; i < 8; i++) {
+    const res = genRound(state);
+    if (res.error) { errors++; break; }
+    eq(res.candidates[0].courts.length, 3); // structural: 3 courts every round
+    eq(res.candidates[0].sittingIds.length, 0); // no sitters
+    if (isPaired(res.candidates[0], markId, graceId)) pairedCount++;
+    state = submitRound(state, res.candidates[0]);
+  }
+
+  test('No error across 8 rounds with 3 courts', () => eq(errors, 0));
+  test('Preferred pair in top-3 options for round 1', () => {
+    const res = genRound(mkState(players, 3, 21, [], pref));
+    assert(res.candidates.slice(0, 3).some(rc => isPaired(rc, markId, graceId)),
+      'Preferred pair not in top-3 with 12 players / 3 courts');
+  });
+  test('Preferred pair appears in at least 3 of 8 rounds (no sitting removes them)', () => {
+    assert(pairedCount >= 3, `paired ${pairedCount}/8 — everyone plays every round, expect every-other`);
+  });
+});
+
+describe('34. Multiple exclusions + multiple preferred — 10 players, 2 courts', () => {
+  // Two exclusions and two preferred pairs coexist.
+  // Critical: exclusions must be respected in EVERY candidate option, not just Option 1.
+  const players = [
+    mkPlayer('Saquib',2), mkPlayer('Calvin',3),
+    mkPlayer('Mark',3), mkPlayer('Grace',3),
+    mkPlayer('Ava',5), mkPlayer('Sheng',4),
+    mkPlayer('Andrea',4), mkPlayer('Jonathan',4),
+    mkPlayer('Christina',4), mkPlayer('P1',2),
+  ];
+  const [saqId, calId, markId, graceId, avaId, shengId] = players.map(p => p.id);
+  const excl = [{ a: saqId, b: calId }, { a: avaId, b: shengId }];
+  const pref = [
+    { a: markId, b: graceId, freq: 'alternate' },
+    { a: saqId, b: shengId, freq: 'occasional' },
+  ];
+  let state = mkState(players, 2, 21, excl, pref);
+
+  let errors = 0, exclViolated = false, mgCount = 0;
+  for (let i = 0; i < 8; i++) {
+    const res = genRound(state);
+    if (res.error) { errors++; break; }
+    // Check ALL candidate options, not just Option 1
+    res.candidates.forEach(rc => {
+      if (isPaired(rc, saqId, calId)) exclViolated = true;
+      if (isPaired(rc, avaId, shengId)) exclViolated = true;
+    });
+    if (isPaired(res.candidates[0], markId, graceId)) mgCount++;
+    state = submitRound(state, res.candidates[0]);
+  }
+
+  test('No error across 8 rounds', () => eq(errors, 0));
+  test('Exclusions never violated in ANY candidate option across all rounds', () => assert(!exclViolated));
+  test('Preferred pair (Mark+Grace) appears in Option 1 at least once', () => assert(mgCount >= 1));
+});
+
+describe('35. Player in two preferred pairs — Mark prefers Grace AND Andrea', () => {
+  // Mark can only partner one person per round.
+  // Alternate mode: Grace-recent → Andrea wins; Andrea-recent → Grace wins.
+  // Combined: Mark pairs with one of his preferred partners nearly every round.
+  const players = [
+    mkPlayer('Mark',3), mkPlayer('Grace',3), mkPlayer('Andrea',4),
+    mkPlayer('P1',3), mkPlayer('P2',3), mkPlayer('P3',2), mkPlayer('P4',4), mkPlayer('P5',3),
+  ];
+  const [markId, graceId, andreaId] = players.map(p => p.id);
+  const pref = [
+    { a: markId, b: graceId, freq: 'alternate' },
+    { a: markId, b: andreaId, freq: 'alternate' },
+  ];
+  let state = mkState(players, 2, 21, [], pref);
+
+  let errors = 0, pairedEither = 0;
+  for (let i = 0; i < 8; i++) {
+    const res = genRound(state);
+    if (res.error) { errors++; break; }
+    const rc = res.candidates[0];
+    if (isPaired(rc, markId, graceId) || isPaired(rc, markId, andreaId)) pairedEither++;
+    state = submitRound(state, res.candidates[0]);
+  }
+
+  test('No crash with player in two preferred pairs', () => eq(errors, 0));
+  test('Mark paired with Grace or Andrea in at least 5 of 8 rounds', () => {
+    assert(pairedEither >= 5, `Mark paired with preferred partner only ${pairedEither}/8 times`);
+  });
+  test('Round 1 has Mark with a preferred partner in top-3 options', () => {
+    const res = genRound(mkState(players, 2, 21, [], pref));
+    const inTop3 = res.candidates.slice(0, 3).some(rc =>
+      isPaired(rc, markId, graceId) || isPaired(rc, markId, andreaId)
+    );
+    assert(inTop3, 'Mark not paired with any preferred partner in top-3 options');
   });
 });
 
