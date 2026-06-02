@@ -1920,9 +1920,11 @@ export default function App() {
 
   // ── SUMMARY ────────────────────────────────────────────────────────────────
   if (state.view === 'summary') {
-    const sorted = [...state.players].sort(
-      (a, b) => b.wins - a.wins || b.gamesPlayed - a.gamesPlayed,
-    );
+    const sorted = [...state.players].sort((a, b) => {
+      const aWinPct = a.gamesPlayed ? a.wins / a.gamesPlayed : 0;
+      const bWinPct = b.gamesPlayed ? b.wins / b.gamesPlayed : 0;
+      return bWinPct - aWinPct;
+    });
     const totalRounds = state.roundNumber - 1;
     const byRound = state.matchHistory.reduce((acc, m) => {
       (acc[m.roundNumber] ??= []).push(m);
