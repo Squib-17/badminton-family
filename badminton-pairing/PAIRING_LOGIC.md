@@ -48,8 +48,10 @@ Before scoring any round, the engine builds a lookup table for every possible
 pair of players. With 8 players there are C(8,2) = 28 pairs.
 
 ```js
-// Example entry for Saquib + Ava after they've played together once:
+// Example entry for Saquib (2) + Ava (5) after they've played together once:
 matrix["saquibId|avaId"] = {
+  pairQuality: "allowed",  // from classify() — "preferred" | "allowed" | "discouraged"
+  staticPenalty: 1,        // from PEN[pairQuality] — 0 | 1 | 3
   timesPartnered: 1,
   lastPartneredRound: 1,   // they played together in round 1
   timesOpposed: 0,
@@ -60,6 +62,30 @@ matrix["saquibId|avaId"] = {
 This matrix is rebuilt from scratch before every round generation using the
 full `matchHistory` array. It is NOT persisted — it's always derived fresh from
 history so it can never go stale.
+
+### `pairQuality` / `staticPenalty` — a skill-pair classifier (currently inert)
+
+Each matrix entry also carries a static, skill-based classification computed by
+`classify(s1, s2)` (~line 41) and `PEN` (~line 46):
+
+```js
+function classify(s1, s2) {
+  if ((s1 >= 4 && s2 >= 4) || (s1 <= 2 && s2 <= 2)) return 'discouraged';
+  const s = s1 + s2;
+  return s >= 5 && s <= 7 ? 'preferred' : 'allowed';
+}
+const PEN = { preferred: 0, allowed: 1, discouraged: 3 };
+```
+
+`buildCandidates` sums each candidate's two-team `staticPenalty` into a `pqScore`
+field (~line 124). **Important:** as the code stands today, `pqScore` is stored
+on the candidate but never read again — it is not added to the score in
+`scoreRound`, and `staticRank` (the pre-sort key) is `skDiff + advStack +
+lowStack`, which does **not** include it. So this classifier is currently inert
+scaffolding. The "both players strong / both weak" case it targets is actually
+penalised by the `W.stacking` weight in `scoreRound` (see §4), not by
+`staticPenalty`. Wiring `pqScore` into the score is an obvious future lever if you
+want a distinct "discouraged pairing" penalty separate from stacking.
 
 ---
 
@@ -96,27 +122,27 @@ Each candidate stores:
 - `advStack` — count of teams where both players are skill ≥ 4 ("stacking")
 - `lowStack` — count of teams where both players are skill ≤ 2
 
-### Static rank boost for preferred pairs
+### Preferred-pair seeded pass for large groups
 
 Each candidate has a `staticRank` used to sort the pool before `findDisjointCombos`
-traverses it. For one-court candidates where a preferred pair is on the same team,
-`staticRank` is reduced by **3 per preferred pair**:
+traverses it:
 
 ```
-staticRank = skDiff + advStack + lowStack - (preferredPairsOnThisCandidate × 3)
+staticRank = skDiff + advStack + lowStack
 ```
 
 This is critical for correctness at large group sizes. With 12 players there are
 1,485 one-court candidates. `findDisjointCombos` caps results at 500 and traverses
-the pool in order. Without sorting (or without the boost), preferred-pair candidates
-can appear in the back half of the lexicographically-ordered array and be missed
-entirely before the cap is hit. The boost pulls them to the front so they are
-explored first.
+the pool in order. Older versions tried to pull preferred pairs forward by reducing
+`staticRank`. The current code does something more explicit: before the normal pass,
+`genRound()` runs a seeded pass for each preferred pair. It finds the best one-court
+candidates containing that pair, anchors one of those courts, then searches the rest
+of the pool for disjoint completions.
 
-The value of 3 is calibrated to overcome typical static rank differences: a preferred
-pair with skDiff=2 gets staticRank=-1, beating a balanced non-preferred pair at 0.
-A wildly imbalanced preferred pair (skDiff≥4) still scores above 0 — the boost does
-not force the engine to create unbalanced courts.
+That seeded pass guarantees preferred-pair combinations are scored at larger group
+sizes without making every preferred-pair court outrank balanced non-preferred
+alternatives. The actual preference strength still comes from `scoreRound()` via
+`preferredAlternate` or `preferredOccasional`.
 
 ### Exclusion filter
 
@@ -194,7 +220,7 @@ anyone else.
 
 ## 5. Diversity Reordering — what "Try another" shows
 
-**Function: `diversifyRanked(sorted)` — ~line 277**
+**Function: `diversifyRanked(sorted)` — ~line 298**
 
 Without reordering, all variants featuring the same strong pairing would
 dominate the first 40+ options. After sorting by score, `diversifyRanked`
@@ -339,12 +365,13 @@ rather than eliminating it.
 | Function | ~Line | What it does |
 |---|---|---|
 | `W` (const) | 11 | All scoring weights — start here |
+| `classify` / `PEN` | 41 / 46 | Skill-pair classifier + static penalty (computed, currently inert) |
 | `buildMatrix` | 51 | Builds partner/opponent history lookup |
 | `buildCandidates` | 83 | Enumerates valid court arrangements; applies exclusion filter |
 | `scoreRound` | 153 | Scores one round candidate; applies preferred bonuses |
 | `mkExpl` | 245 | Generates the green/amber explanation chips |
-| `diversifyRanked` | 277 | Reorders for "Try another" variety |
-| `genRound` | 310 | Orchestrates the above into a ranked list |
-| `mkPlayer` | 426 | Player data model |
-| `INIT` | 442 | Initial app state |
-| `reducer` | 455 | All state transitions (ADD_P, SUBMIT, RESET, etc.) |
+| `diversifyRanked` | 298 | Reorders for "Try another" variety |
+| `genRound` | 360 | Orchestrates the above into a ranked list |
+| `mkPlayer` | 457 | Player data model |
+| `INIT` | 473 | Initial app state |
+| `reducer` | 488 | All state transitions (ADD_P, SUBMIT, RESET, etc.) |
